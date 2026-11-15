@@ -96,6 +96,45 @@ java -cp "target/classes:target/deps/*" com.example.ServiceA 10
 
 Within 5s of the START lines, press Ctrl+C in pod-1 (or `kill -9` that process). When the acquisition lock expires (default 30s), pod-1's in-flight jobs restart on pod-2 as attempt 2. The 15s job must stay shorter than that lock.
 
+## Client configs vs lock duration
+
+`ServiceB.config()` is **client** config only (`p.put(...)`). Keep both of these:
+
+```java
+p.put("share.acquire.mode", "record_limit"); // never take more than max.poll.records; no prefetch
+p.put("max.poll.records", "1");              // 1 job per slot
+```
+
+Do not drop `record_limit` just because `max.poll.records` is `1`. Default acquire mode is `batch_optimized`: a poll can return **more than** `max.poll.records` (producer batch boundaries) and can **prefetch** extra records onto that consumer. Then a busy slot holds jobs other slots could have taken.
+
+Do **not** put lock duration in Java. `group.share.record.lock.duration.ms` is a **broker** setting. Kafka ignores it on the consumer `Properties`.
+
+**Broker default** (all share groups) — `config/server.properties`, then restart Kafka:
+
+```properties
+group.share.record.lock.duration.ms=60000
+```
+
+Broker bounds (also `server.properties`):
+
+| Config | Default | Meaning |
+| --- | --- | --- |
+| `group.share.min.record.lock.duration.ms` | 15000 | shortest allowed lock |
+| `group.share.record.lock.duration.ms` | 30000 | default lock |
+| `group.share.max.record.lock.duration.ms` | 60000 | longest allowed lock |
+
+**This demo’s group only** — group-level name is `share.record.lock.duration.ms` (no `group.` prefix):
+
+```bash
+$KAFKA_HOME/bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+  --entity-type groups --entity-name service-b-workers \
+  --alter --add-config share.record.lock.duration.ms=60000
+```
+
+A group value outside min/max is rejected until you raise those broker limits.
+
+This demo sleeps 15s, so the default 30s lock is already enough. If a job can run longer than the lock, either raise the lock, or keep explicit ack and call `acknowledge(job, AcknowledgeType.RENEW)` before the lock expires. After a crash, wait for the lock to expire before expecting redelivery.
+
 ## Reset between rehearsals
 
 Stop both pods, then re-run the "fresh topic" commands above (`--delete` and `--create`).
